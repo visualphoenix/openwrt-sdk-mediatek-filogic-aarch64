@@ -1,0 +1,103 @@
+name: Build and publish SDK
+
+# Builds the aarch64 OpenWrt SDK tarball on a native arm64 runner and
+# attaches it to a GitHub Release. Two trigger modes:
+#
+#   - push to main           -> rolling "latest" prerelease (assets clobbered)
+#   - workflow_dispatch      -> optional tag_name input; if supplied, attach
+#                               to that tag as a proper release. Otherwise
+#                               fall back to the rolling "latest" prerelease.
+#
+# Runs build-sdk.sh directly on the runner (no Docker) to avoid DinD
+# overhead. The buildroot under ./sdk is cached across runs via
+# actions-cache keyed on build inputs. First run is ~1-2h (full toolchain
+# build); subsequent runs skip straight to `make sdk` (~minutes).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to attach the tarball to (defaults to rolling "latest")
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      SDK_TARGET: mediatek/filogic
+      OPENWRT_BRANCH: SNAPSHOT
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build deps
+        run: make deps
+
+      - name: Restore buildroot cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: sdk
+          key: buildroot-${{ env.SDK_TARGET }}-${{ env.OPENWRT_BRANCH }}-${{ hashFiles('scripts/build-sdk.sh', 'scripts/install-deps.sh') }}
+
+      - name: Build SDK tarball
+        run: make build-bare
+
+      - name: Resolve tarball path
+        id: tarball
+        run: |
+          t=$(ls bin/openwrt-sdk-*.Linux-aarch64.tar.zst | head -1)
+          echo "path=$t" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$t")" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release tag
+        id: release
+        run: |
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            echo "tag=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upsert release and upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          asset_path="${{ steps.tarball.outputs.path }}"
+          sha="${{ github.sha }}"
+          notes="aarch64 OpenWrt SDK tarball built from $sha on ${{ github.run_id }}."
+
+          if [ "$tag" = "latest" ]; then
+            # Rolling release: delete + recreate so the tag, target_commitish,
+            # and source code zip/tarball all track the current sha. Plain
+            # `gh release upload --clobber` only replaces the asset bytes —
+            # the tag stays pinned to the first run's commit.
+            gh release delete "$tag" --cleanup-tag --yes || true
+            gh release create "$tag" "$asset_path" \
+              --target "$sha" \
+              --title "OpenWrt SDK ($tag)" \
+              --latest=false \
+              --prerelease \
+              --notes "$notes"
+          else
+            # Named tag: upsert. Tag is expected to already exist (pushed by
+            # the user); we just attach the asset to it.
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              gh release create "$tag" "$asset_path" \
+                --target "$sha" \
+                --title "OpenWrt SDK ($tag)" \
+                --latest=false \
+                --prerelease \
+                --notes "$notes"
+            else
+              gh release upload "$tag" "$asset_path" --clobber
+            fi
+          fi
